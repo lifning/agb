@@ -930,6 +930,27 @@ impl<'a> Object<'a> {
         self
     }
 
+    /// TODO
+    pub fn enable_blending(&mut self) -> &mut Self {
+        let object_inner = unsafe { self.object_inner() };
+        object_inner.attrs.a0.set_graphics_mode(GraphicsMode::AlphaBlending);
+        self
+    }
+
+    /// TODO
+    pub fn use_as_obj_window(&mut self) -> &mut Self {
+        let object_inner = unsafe { self.object_inner() };
+        object_inner.attrs.a0.set_graphics_mode(GraphicsMode::Window);
+        self
+    }
+
+    /// TODO
+    pub fn render_normally(&mut self) -> &mut Self {
+        let object_inner = unsafe { self.object_inner() };
+        object_inner.attrs.a0.set_graphics_mode(GraphicsMode::Normal);
+        self
+    }
+
     /// Hides the object. No change will be seen until
     /// [ObjectController::commit] is called.
     pub fn hide(&mut self) -> &mut Self {
