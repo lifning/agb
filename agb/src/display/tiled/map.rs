@@ -347,7 +347,7 @@ impl AffineMap {
     pub fn set_scale_only(
         &mut self,
         scale: Vector2D<Num<i16, 8>>,
-        destination: Vector2D<Num<i32, 8>>
+        destination: Vector2D<Num<i32, 8>>,
     ) {
         self.set_transform_raw(BgAffineSetData {
             matrix: AffineMatrixAttributes {

@@ -17,6 +17,7 @@ use super::palette16::Palette16;
 use super::{Priority, DISPLAY_CONTROL};
 use crate::agb_alloc::block_allocator::BlockAllocator;
 use crate::agb_alloc::bump_allocator::StartEnd;
+use crate::bitarray::Bitarray;
 use crate::dma;
 use crate::fixnum::{Num, Vector2D};
 use crate::hash_map::HashMap;
@@ -538,6 +539,37 @@ pub struct Object<'a> {
     loan: Loan<'a>,
 }
 
+/// TODO: docdouble_size
+pub struct AffineMatrixBorrow<'a> {
+    index: u8,
+    double_size: bool,
+    phantom: ObjectControllerReference<'a>,
+}
+
+impl Clone for AffineMatrixBorrow<'_> {
+    fn clone(&self) -> Self {
+        let mut s = unsafe { get_object_controller(self.phantom) };
+        s.affine_matrix_refcounts[self.index as usize] += 1;
+        Self {
+            index: self.index,
+            double_size: self.double_size,
+            phantom: self.phantom,
+        }
+    }
+}
+
+impl Drop for AffineMatrixBorrow<'_> {
+    fn drop(&mut self) {
+        let mut s = unsafe { get_object_controller(self.phantom) };
+        let n = self.index;
+        let n = n as usize;
+        s.affine_matrix_refcounts[n] -= 1;
+        if s.affine_matrix_refcounts[n] == 0 {
+            s.free_affine_matrices.set(n, false);
+        }
+    }
+}
+
 struct SpriteControllerInner {
     palette: HashMap<PaletteId, Storage>,
     sprite: HashMap<SpriteId, Storage>,
@@ -565,16 +597,18 @@ struct ObjectInner {
     attrs: Attributes,
     sprite: SpriteBorrow<'static>,
     previous_sprite: SpriteBorrow<'static>,
+    affine_matrix: Option<AffineMatrixBorrow<'static>>,
     destroy: bool,
     z: i32,
 }
 
 struct ObjectControllerStatic {
-    _free_affine_matricies: Vec<u8>,
     free_object: Vec<u8>,
     shadow_oam: Vec<Option<ObjectInner>>,
     z_order: Vec<u8>,
     sprite_controller: SpriteControllerInner,
+    free_affine_matrices: Bitarray<1>,
+    affine_matrix_refcounts: [u8; 32],
 }
 
 impl ObjectControllerStatic {
@@ -583,8 +617,9 @@ impl ObjectControllerStatic {
             shadow_oam: (0..128).map(|_| None).collect(),
             z_order: (0..128).collect(),
             free_object: (0..128).collect(),
-            _free_affine_matricies: (0..32).collect(),
             sprite_controller: SpriteControllerInner::new(),
+            free_affine_matrices: Bitarray::new(),
+            affine_matrix_refcounts: [0u8; 32],
         }
     }
 
@@ -789,6 +824,7 @@ impl ObjectController {
             attrs,
             z: 0,
             previous_sprite: new_sprite.clone(&mut s.sprite_controller),
+            affine_matrix: None,
             destroy: false,
             sprite: new_sprite,
         });
@@ -857,6 +893,23 @@ impl ObjectController {
                 .try_get_sprite(sprite)
         }
     }
+
+    /// TODO: doc
+    pub fn try_get_new_affine_matrix(&self, double_size: bool) -> Option<AffineMatrixBorrow<'_>> {
+        let s = unsafe { get_object_controller(self.phantom).very_unsafe_borrow() };
+        match s.free_affine_matrices.first_zero() {
+            None => None,
+            Some(n) => {
+                s.free_affine_matrices.set(n, true);
+                s.affine_matrix_refcounts[n] += 1;
+                Some(AffineMatrixBorrow {
+                    index: n as u8,
+                    double_size,
+                    phantom: self.phantom,
+                })
+            }
+        }
+    }
 }
 
 impl<'a> Object<'a> {
@@ -888,8 +941,16 @@ impl<'a> Object<'a> {
     /// [ObjectController::commit] is called.
     pub fn show(&mut self) -> &mut Self {
         let object_inner = unsafe { self.object_inner() };
-        object_inner.attrs.a0.set_object_mode(ObjectMode::Normal);
-
+        match &object_inner.affine_matrix {
+            None => object_inner.attrs.a0.set_object_mode(ObjectMode::Normal),
+            Some(m) => {
+                object_inner.attrs.a0.set_object_mode(if m.double_size {
+                    ObjectMode::AffineDouble
+                } else {
+                    ObjectMode::Affine
+                });
+            }
+        }
         self
     }
 
@@ -921,7 +982,7 @@ impl<'a> Object<'a> {
         self
     }
 
-    /// Sets the z priority of the sprite. Higher priority will be dislayed
+    /// Sets the z priority of the sprite. Higher priority will be displayed
     /// above background layers with lower priorities. No change will be seen
     /// until [ObjectController::commit] is called.
     pub fn set_priority(&mut self, priority: Priority) -> &mut Self {
@@ -931,23 +992,60 @@ impl<'a> Object<'a> {
     }
 
     /// TODO
+    pub fn set_affine_matrix(&mut self, matrix_borrow: Option<AffineMatrixBorrow<'static>>) -> &mut Self {
+        let object_inner = unsafe { self.object_inner() };
+        if let Some(m) = &matrix_borrow {
+            object_inner.attrs.a1a.set_affine_index(m.index);
+        }
+        object_inner.affine_matrix = matrix_borrow;
+        if let ObjectMode::Disabled = object_inner.attrs.a0.object_mode() {
+            self
+        } else {
+            self.show()
+        }
+    }
+
+    /// TODO
+    pub fn set_affine_double(&mut self, double_size: bool) -> &mut Self {
+        let object_inner = unsafe { self.object_inner() };
+        if let Some(m) = &mut object_inner.affine_matrix {
+            m.double_size = double_size;
+            object_inner.attrs.a0.set_object_mode(if double_size {
+                ObjectMode::AffineDouble
+            } else {
+                ObjectMode::Affine
+            });
+        }
+        self
+    }
+
+    /// TODO
     pub fn enable_blending(&mut self) -> &mut Self {
         let object_inner = unsafe { self.object_inner() };
-        object_inner.attrs.a0.set_graphics_mode(GraphicsMode::AlphaBlending);
+        object_inner
+            .attrs
+            .a0
+            .set_graphics_mode(GraphicsMode::AlphaBlending);
         self
     }
 
     /// TODO
     pub fn use_as_obj_window(&mut self) -> &mut Self {
         let object_inner = unsafe { self.object_inner() };
-        object_inner.attrs.a0.set_graphics_mode(GraphicsMode::Window);
+        object_inner
+            .attrs
+            .a0
+            .set_graphics_mode(GraphicsMode::Window);
         self
     }
 
     /// TODO
     pub fn render_normally(&mut self) -> &mut Self {
         let object_inner = unsafe { self.object_inner() };
-        object_inner.attrs.a0.set_graphics_mode(GraphicsMode::Normal);
+        object_inner
+            .attrs
+            .a0
+            .set_graphics_mode(GraphicsMode::Normal);
         self
     }
 
